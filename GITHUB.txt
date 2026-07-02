@@ -1,0 +1,207 @@
+# ==============================================================================
+# 1. Install and load packages
+# ==============================================================================
+
+pkg_list <- c("gbmt","dplyr","writexl")
+new_pkg <- pkg_list[!(pkg_list %in% installed.packages()[,"Package"])]
+if(length(new_pkg)>0){
+  install.packages(new_pkg,dependencies=TRUE,quiet=TRUE)
+}
+
+library(gbmt)
+library(dplyr)
+library(writexl)
+
+# ==============================================================================
+# 2. Import dataset
+# ==============================================================================
+
+df <- read.csv(
+  "C:/Users/yan31/Desktop/敏感性分析-SCOER.csv",
+  fileEncoding="UTF-8-BOM",
+  stringsAsFactors=FALSE,
+  skipNul=TRUE
+)
+
+keep_cols <- c("stay_id","hour","outcome","HR","SBP","DBP","RR","Temp_F","SPO2")
+df <- df[,intersect(colnames(df),keep_cols)]
+
+# ==============================================================================
+# 3. Data preprocessing
+# ==============================================================================
+
+df$stay_id <- as.character(df$stay_id)
+
+numeric_cols <- c("hour","outcome","HR","SBP","DBP","RR","Temp_F","SPO2")
+df[numeric_cols] <- lapply(df[numeric_cols],as.numeric)
+
+df <- df %>%
+  filter(
+    !is.na(stay_id),
+    hour %in% c(0,8,24),
+    complete.cases(HR,SBP,DBP,RR,Temp_F,SPO2)
+  ) %>%
+  distinct(stay_id,hour,.keep_all=TRUE)
+
+cat("Total records:",nrow(df),"\n")
+cat("Unique patients:",length(unique(df$stay_id)),"\n")
+
+# ==============================================================================
+# 4. Model configuration parameters
+# ==============================================================================
+
+indicator_cols <- c("HR","SBP","DBP","RR","Temp_F","SPO2")
+
+unit_col <- "stay_id"
+time_col <- "hour"
+
+poly_order <- 1
+ng_range <- 2:6
+
+# ==============================================================================
+# ⭐ Key Optimization 1: Standardize variables to accelerate EM convergence
+# ==============================================================================
+
+df[indicator_cols] <- scale(df[indicator_cols])
+
+# ==============================================================================
+# ⭐ Key Optimization 2: Sort dataset to improve computation efficiency
+# ==============================================================================
+
+df <- df[order(df$stay_id,df$hour),]
+
+# ==============================================================================
+# 5. Fit GBMTM model (high-speed version)
+# ==============================================================================
+
+cat("\nStart fitting GBMTM models...\n")
+
+model_list <- list()
+
+for(ng in ng_range){
+  
+  cat("Fitting model with",ng,"trajectory clusters...\n")
+  
+  model <- gbmt(
+    x.names = indicator_cols,
+    unit = unit_col,
+    time = time_col,
+    d = poly_order,
+    ng = ng,
+    data = df,
+    scaling = 0,
+    maxit = 30   # ⭐ Limit maximum EM iterations
+  )
+  
+  model_list[[as.character(ng)]] <- model
+  
+}
+
+# ==============================================================================
+# 6. Model evaluation metrics
+# ==============================================================================
+
+model_metrics <- lapply(ng_range,function(ng){
+  
+  model <- model_list[[as.character(ng)]]
+  
+  bic_value <- as.numeric(model$ic[2])
+  avepp_value <- mean(model$appa)
+  
+  cluster_counts <- table(model$assign)
+  cluster_ratio <- round(cluster_counts/sum(cluster_counts)*100,1)
+  
+  data.frame(
+    ClusterNumber = ng,
+    BIC = bic_value,
+    Avepp = avepp_value,
+    Cluster1_Pct = ifelse("1"%in%names(cluster_ratio),cluster_ratio["1"],0),
+    Cluster2_Pct = ifelse("2"%in%names(cluster_ratio),cluster_ratio["2"],NA),
+    Cluster3_Pct = ifelse("3"%in%names(cluster_ratio),cluster_ratio["3"],NA)
+  )
+  
+})
+
+model_metrics <- do.call(rbind,model_metrics)
+
+print(model_metrics)
+
+# ==============================================================================
+# 7. Select optimal model
+# ==============================================================================
+
+optimal_ng <- model_metrics$ClusterNumber[which.min(model_metrics$BIC)]
+optimal_model <- model_list[[as.character(optimal_ng)]]
+
+cat("Optimal trajectory cluster number:",optimal_ng,"\n")
+
+# ==============================================================================
+# 8. Assign trajectory subgroups to patients
+# ==============================================================================
+
+trajectory_group <- data.frame(
+  stay_id = unique(df$stay_id),
+  Group = paste0("Group",optimal_model$assign),
+  # New column: record optimal cluster count for reference
+  Optimal_Cluster_Num = optimal_ng
+)
+
+# ==============================================================================
+# 8.1 Export patient subgroup assignments as independent CSV (core new code)
+# ==============================================================================
+output_csv_path <- "C:/Users/yan31/Desktop/Patient_Trajectory_Group.csv"
+write.csv(
+  x = trajectory_group,
+  file = output_csv_path,
+  fileEncoding = "UTF-8",  # Ensure no garbled Chinese characters
+  row.names = FALSE        # Remove default row index for clean output
+)
+cat("✅ Patient subgroup file exported to:", output_csv_path, "\n")
+
+# ==============================================================================
+# 9. Calculate mortality rate by subgroup
+# ==============================================================================
+
+mortality_result <- df %>%
+  distinct(stay_id,outcome) %>%
+  left_join(trajectory_group,by="stay_id") %>%
+  group_by(Group) %>%
+  summarise(
+    Total_Patients = n(),
+    Death_Count = sum(outcome,na.rm=TRUE),
+    Mortality_Rate_Pct = round(Death_Count/Total_Patients*100,1),
+    .groups="drop"
+  )
+
+print(mortality_result)
+
+# ==============================================================================
+# 10. Longitudinal trajectory trends of vital signs
+# ==============================================================================
+
+trend_result <- df %>%
+  left_join(trajectory_group,by="stay_id") %>%
+  group_by(Group,hour) %>%
+  summarise(
+    across(all_of(indicator_cols),~round(mean(.x,na.rm=TRUE),2)),
+    .groups="drop"
+  ) %>%
+  arrange(Group,hour)
+
+print(head(trend_result))
+
+# ==============================================================================
+# 11. Export all results to Excel workbook
+# ==============================================================================
+
+write_xlsx(
+  list(
+    Model_Evaluation_Metrics = model_metrics,
+    Mortality_By_Trajectory = mortality_result,
+    Vital_Sign_Trends = trend_result,
+    Patient_Trajectory_Assignment = trajectory_group  # Duplicate subgroup data inside Excel for cross-check
+  ),
+  "C:/Users/yan31/Desktop/GBMTM_Results.xlsx"
+)
+
+cat("\nGBMTM modeling pipeline finished\n")
